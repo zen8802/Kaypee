@@ -2,148 +2,148 @@ import { WalletTrade, DiscoveryCandidate, TradeFingerprint, WalletClassification
 import { scoreWallet } from './walletScorer';
 import { getWallets } from './store';
 
-const POLYMARKET_SUBGRAPH = 'https://api.thegraph.com/subgraphs/name/polymarket/polymarket-matic';
-const POLYMARKET_GAMMA_BASE = 'https://gamma-api.polymarket.com';
+const DATA_API = 'https://data-api.polymarket.com';
 
-// ============================================================
-// Step 1: Pull candidate wallets from Polymarket
-// ============================================================
-
-interface SubgraphPosition {
-  user: { id: string };
-  market: { id: string; question: string; endTime: string };
-  outcome: string;
-  amount: string;
-  timestamp: string;
+interface PolyTrade {
+  proxyWallet?: string;
+  side?: string;
+  size?: number;
+  price?: number;
+  timestamp?: number;
+  title?: string;
+  slug?: string;
+  outcome?: string;
+  outcomeIndex?: number;
 }
 
-interface SubgraphResponse {
-  data?: {
-    userPositions?: SubgraphPosition[];
-  };
-}
+// ============================================================
+// Step 1: Pull candidate wallets from Polymarket public trades
+// ============================================================
 
 /**
- * Query the Polymarket subgraph for active wallets in the last N days.
- * Falls back to Gamma API if subgraph is unavailable.
+ * Fetch recent trades from the public Polymarket data API and group by wallet.
+ * Paginates to collect a large enough sample to find active traders.
  */
 export async function fetchCandidateWallets(
   days: number = 60,
-  limit: number = 500
+  maxTrades: number = 5000
 ): Promise<Map<string, WalletTrade[]>> {
   const walletTrades = new Map<string, WalletTrade[]>();
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  let offset = 0;
+  const pageSize = 500;
+  let totalFetched = 0;
 
-  // Try subgraph first
-  try {
-    const since = Math.floor((Date.now() - days * 24 * 60 * 60 * 1000) / 1000);
-    const query = `{
-      userPositions(
-        where: { amount_gt: "100000000", timestamp_gt: "${since}" }
-        orderBy: timestamp
-        orderDirection: desc
-        first: ${limit}
-      ) {
-        user { id }
-        market { id question endTime }
-        outcome
-        amount
-        timestamp
+  // Paginate through recent trades
+  for (let page = 0; page < Math.ceil(maxTrades / pageSize); page++) {
+    try {
+      const res = await fetch(
+        `${DATA_API}/trades?limit=${pageSize}&offset=${offset}`
+      );
+
+      if (!res.ok) {
+        console.error(`Trades fetch failed at offset ${offset}: ${res.status}`);
+        break;
       }
-    }`;
 
-    const res = await fetch(POLYMARKET_SUBGRAPH, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
-    });
+      const trades: PolyTrade[] = await res.json();
+      if (!trades.length) break;
 
-    if (res.ok) {
-      const json: SubgraphResponse = await res.json();
-      const positions = json.data?.userPositions ?? [];
+      for (const t of trades) {
+        const addr = (t.proxyWallet || '').toLowerCase();
+        if (!addr) continue;
 
-      for (const pos of positions) {
-        const addr = pos.user.id.toLowerCase();
-        const trades = walletTrades.get(addr) || [];
-        trades.push({
-          market_slug: pos.market.id,
-          market_title: pos.market.question,
-          outcome: pos.outcome.toUpperCase() === 'YES' ? 'YES' : 'NO',
-          side: 'BUY',
-          price: 0.5, // subgraph doesn't give price directly
-          size: parseInt(pos.amount) / 1e6, // USDC has 6 decimals
-          timestamp: new Date(parseInt(pos.timestamp) * 1000).toISOString(),
-          resolved: pos.market.endTime ? parseInt(pos.market.endTime) * 1000 < Date.now() : false,
+        // Check timestamp cutoff
+        const ts = t.timestamp ? t.timestamp * 1000 : Date.now();
+        if (ts < cutoff) continue;
+
+        const existing = walletTrades.get(addr) || [];
+        existing.push({
+          market_slug: t.slug || '',
+          market_title: t.title || '',
+          outcome: t.outcome?.toUpperCase() === 'NO' ? 'NO' : 'YES',
+          side: (t.side || 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+          price: t.price ?? 0.5,
+          size: t.size ?? 0,
+          timestamp: t.timestamp
+            ? new Date(t.timestamp * 1000).toISOString()
+            : new Date().toISOString(),
+          resolved: false,
           resolution_outcome: null,
           pnl: null,
         });
-        walletTrades.set(addr, trades);
+        walletTrades.set(addr, existing);
       }
 
-      if (walletTrades.size > 0) return walletTrades;
+      totalFetched += trades.length;
+      offset += pageSize;
+
+      // If the last trade is older than our cutoff, stop
+      const lastTs = trades[trades.length - 1]?.timestamp;
+      if (lastTs && lastTs * 1000 < cutoff) break;
+    } catch (e) {
+      console.error(`Page ${page} fetch error:`, e);
+      break;
     }
-  } catch (e) {
-    console.error('Subgraph query failed, falling back to Gamma:', e);
   }
 
-  // Fallback: use Gamma API leaderboard / recent activity
-  try {
-    const res = await fetch(
-      `${POLYMARKET_GAMMA_BASE}/markets?closed=true&limit=50&order=volume&ascending=false`
-    );
-    if (res.ok) {
-      interface GammaMarket {
-        id?: string;
+  console.log(`Discovery: fetched ${totalFetched} trades from ${walletTrades.size} unique wallets`);
+
+  // Now enrich top wallets with their full history
+  // Sort wallets by trade count, take top ones
+  const sorted = Array.from(walletTrades.entries())
+    .sort((a, b) => b[1].length - a[1].length);
+
+  // For the top wallets, fetch their full activity history
+  const enrichCount = Math.min(100, sorted.length);
+  for (let i = 0; i < enrichCount; i++) {
+    const [addr, existingTrades] = sorted[i];
+    if (existingTrades.length >= 10) continue; // already have enough from bulk fetch
+
+    try {
+      const res = await fetch(
+        `${DATA_API}/activity?user=${addr}&limit=500`
+      );
+      if (!res.ok) continue;
+
+      interface ActivityEntry {
+        side?: string;
+        size?: number;
+        price?: number;
+        timestamp?: number;
+        title?: string;
         slug?: string;
-        question?: string;
-        endDate?: string;
+        outcome?: string;
+        type?: string;
       }
-      const markets: GammaMarket[] = await res.json();
 
-      // For each high-volume resolved market, fetch recent traders
-      for (const market of markets.slice(0, 20)) {
-        try {
-          const actRes = await fetch(
-            `${POLYMARKET_GAMMA_BASE}/activity?market=${market.slug || market.id}&limit=200`
-          );
-          if (!actRes.ok) continue;
+      const activities: ActivityEntry[] = await res.json();
+      const enriched: WalletTrade[] = [];
 
-          interface GammaActivity {
-            address?: string;
-            user?: string;
-            outcome?: string;
-            side?: string;
-            price?: string;
-            size?: string;
-            timestamp?: string;
-          }
-
-          const activities: GammaActivity[] = await actRes.json();
-
-          for (const act of activities) {
-            const addr = (act.address || act.user || '').toLowerCase();
-            if (!addr) continue;
-            const trades = walletTrades.get(addr) || [];
-            trades.push({
-              market_slug: market.slug || market.id || '',
-              market_title: market.question || '',
-              outcome: (act.outcome?.toUpperCase() === 'YES' ? 'YES' : 'NO') as 'YES' | 'NO',
-              side: (act.side?.toUpperCase() === 'BUY' ? 'BUY' : 'SELL') as 'BUY' | 'SELL',
-              price: parseFloat(act.price || '0.5'),
-              size: parseFloat(act.size || '0'),
-              timestamp: act.timestamp || new Date().toISOString(),
-              resolved: market.endDate ? new Date(market.endDate).getTime() < Date.now() : false,
-              resolution_outcome: null,
-              pnl: null,
-            });
-            walletTrades.set(addr, trades);
-          }
-        } catch {
-          // skip individual market failures
-        }
+      for (const a of activities) {
+        if (!a.side || a.type === 'REDEEM') continue;
+        enriched.push({
+          market_slug: a.slug || '',
+          market_title: a.title || '',
+          outcome: a.outcome?.toUpperCase() === 'NO' ? 'NO' : 'YES',
+          side: a.side.toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+          price: a.price ?? 0.5,
+          size: a.size ?? 0,
+          timestamp: a.timestamp
+            ? new Date(a.timestamp * 1000).toISOString()
+            : new Date().toISOString(),
+          resolved: false,
+          resolution_outcome: null,
+          pnl: null,
+        });
       }
+
+      if (enriched.length > existingTrades.length) {
+        walletTrades.set(addr, enriched);
+      }
+    } catch {
+      // skip enrichment failures
     }
-  } catch (e) {
-    console.error('Gamma fallback also failed:', e);
   }
 
   return walletTrades;
@@ -176,6 +176,7 @@ export function buildFingerprint(trades: WalletTrade[]): TradeFingerprint {
   // Both sides check
   const marketSides = new Map<string, Set<string>>();
   for (const t of trades) {
+    if (!t.market_slug) continue;
     const sides = marketSides.get(t.market_slug) || new Set<string>();
     sides.add(t.outcome);
     marketSides.set(t.market_slug, sides);
@@ -192,18 +193,18 @@ export function buildFingerprint(trades: WalletTrade[]): TradeFingerprint {
     hourCounts[h]++;
   });
   const activeHours = hourCounts
-    .map((c, i) => (c > 0 ? i : -1))
-    .filter((h) => h >= 0);
+    .map((c: number, i: number) => (c > 0 ? i : -1))
+    .filter((h: number) => h >= 0);
 
-  // Category concentration (rough, based on title keywords)
+  // Category concentration
   const catMap: Record<string, number> = {};
   for (const t of trades) {
-    const title = t.market_title.toLowerCase();
+    const title = (t.market_title || '').toLowerCase();
     let cat = 'other';
     if (/elect|president|congress|vote|senate|politi/.test(title)) cat = 'politics';
     else if (/gdp|inflation|cpi|fed|unemployment|jobs|rate/.test(title)) cat = 'economics';
-    else if (/bitcoin|btc|eth|crypto/.test(title)) cat = 'crypto';
-    else if (/nfl|nba|mlb|nhl|sport|game/.test(title)) cat = 'sports';
+    else if (/bitcoin|btc|eth|crypto|solana/.test(title)) cat = 'crypto';
+    else if (/nfl|nba|mlb|nhl|sport|game|match|championship/.test(title)) cat = 'sports';
     catMap[cat] = (catMap[cat] || 0) + 1;
   }
 
@@ -219,7 +220,7 @@ export function buildFingerprint(trades: WalletTrade[]): TradeFingerprint {
     }
   }
 
-  // Directional ratio: for each market, what % are one-sided
+  // Directional ratio
   let directionalMarkets = 0;
   marketSides.forEach((sides) => {
     if (sides.size === 1) directionalMarkets++;
@@ -239,7 +240,7 @@ export function buildFingerprint(trades: WalletTrade[]): TradeFingerprint {
     active_hours: activeHours,
     category_concentration: catMap,
     longest_win_streak: maxStreak,
-    avg_entry_before_close_hours: 48, // placeholder — would need market close times
+    avg_entry_before_close_hours: 48,
     directional_ratio: marketSides.size > 0 ? directionalMarkets / marketSides.size : 0,
   };
 }
@@ -267,7 +268,7 @@ Active hours (UTC): [${fingerprint.active_hours.join(', ')}] (${fingerprint.acti
 Category concentration: ${JSON.stringify(fingerprint.category_concentration)}
 Longest win streak: ${fingerprint.longest_win_streak}
 Directional ratio: ${(fingerprint.directional_ratio * 100).toFixed(1)}% of markets are one-sided
-${score ? `Win rate: ${(score.win_rate * 100).toFixed(1)}%` : 'Score: insufficient data'}
+${score ? `Win rate: ${(score.win_rate * 100).toFixed(1)}%` : 'Score: insufficient resolved data'}
 ${score ? `ROI: ${(score.roi * 100).toFixed(1)}%` : ''}
 ${score ? `Composite score: ${score.composite.toFixed(3)}` : ''}
 ${score?.is_suspicious_insider ? 'FLAG: Suspicious insider pattern detected' : ''}`;
@@ -284,11 +285,13 @@ ${score?.is_suspicious_insider ? 'FLAG: Suspicious insider pattern detected' : '
       max_tokens: 500,
       system: `You classify prediction market wallet addresses based on their trading fingerprint.
 
-Classify into exactly ONE of these categories:
-- "bot": Trades execute in <5s gaps, perfect round sizes, 24/7 activity, hundreds of markets
-- "arb": Always on both YES and NO sides (>40% both-sides), profit from spread not direction
-- "human-retail": Normal human trader, average performance, nothing special
-- "human-informed": High win rate on directional bets, concentrated in few categories, entry timing 12-96hrs before resolution, irreguliar timing suggesting human, NOT a bot
+Classify into exactly ONE category:
+- "bot": Median trade gap <5s, perfect round sizes (>70%), active 20+/24 hours, hundreds of markets simultaneously
+- "arb": >40% of markets have both YES and NO positions, profit from spread not direction
+- "human-retail": Normal human trader, average performance, nothing exceptional
+- "human-informed": High win rate on directional bets, concentrated in few categories, directional ratio >60%, irregular timing suggesting human NOT bot, suspiciously good
+
+When in doubt between human-retail and human-informed, look at: win rate >55%, directional ratio, category concentration, and win streaks.
 
 Output ONLY valid JSON:
 {
@@ -333,11 +336,11 @@ export async function runDiscoveryPipeline(
   days: number = 60,
   minTrades: number = 10,
   minVolume: number = 500,
-  maxCandidates: number = 500,
+  maxTrades: number = 5000,
   classifyTop: number = 30
 ): Promise<DiscoveryCandidate[]> {
-  // Step 1: Fetch universe
-  const walletTrades = await fetchCandidateWallets(days, maxCandidates);
+  // Step 1: Fetch universe of trades
+  const walletTrades = await fetchCandidateWallets(days, maxTrades);
 
   const trackedAddresses = new Set(
     getWallets().map((w) => w.address.toLowerCase())
@@ -347,21 +350,19 @@ export async function runDiscoveryPipeline(
   const candidates: DiscoveryCandidate[] = [];
 
   walletTrades.forEach((trades, address) => {
-    // Min trade count filter
     if (trades.length < minTrades) return;
 
-    // Min volume filter
     const totalVolume = trades.reduce((s, t) => s + t.size, 0);
     if (totalVolume < minVolume) return;
 
-    // Directional filter: require majority buys
+    // Require some buy activity
     const buys = trades.filter((t) => t.side === 'BUY');
-    if (buys.length < trades.length * 0.3) return;
+    if (buys.length < 3) return;
 
     const fingerprint = buildFingerprint(trades);
     const score = scoreWallet(trades);
 
-    // Calculate basic stats
+    // Basic stats
     const resolvedBuys = buys.filter((t) => t.resolved && t.resolution_outcome);
     const wins = resolvedBuys.filter((t) => t.outcome === t.resolution_outcome).length;
     const winRate = resolvedBuys.length > 0 ? wins / resolvedBuys.length : 0;
@@ -394,10 +395,10 @@ export async function runDiscoveryPipeline(
     });
   });
 
-  // Sort by composite score (or win rate if no score)
+  // Sort by trade count (most active first, since we may not have resolution data)
   candidates.sort((a, b) => {
-    const scoreA = a.score?.composite ?? a.win_rate * 0.5;
-    const scoreB = b.score?.composite ?? b.win_rate * 0.5;
+    const scoreA = a.score?.composite ?? (a.trade_count / 100);
+    const scoreB = b.score?.composite ?? (b.trade_count / 100);
     return scoreB - scoreA;
   });
 
@@ -416,10 +417,9 @@ export async function runDiscoveryPipeline(
     } catch (e) {
       console.error(`Classification failed for ${candidate.address}:`, e);
       candidate.classification = 'human-retail';
-      candidate.classification_reasoning = 'Classification failed';
+      candidate.classification_reasoning = 'Classification API call failed';
     }
   }
 
-  // Return all candidates but with top ones classified
   return candidates;
 }
